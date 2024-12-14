@@ -5,12 +5,14 @@ mod ui;
 use config::Config;
 use test::{results::Results, Test};
 
+use clap::Parser;
 use crossterm::{
     self, cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, terminal,
 };
 use rand::{seq::SliceRandom, thread_rng};
+use ratatui::{backend::CrosstermBackend, terminal::Terminal};
 use rust_embed::RustEmbed;
 use std::{
     ffi::OsString,
@@ -20,52 +22,68 @@ use std::{
     path::PathBuf,
     str,
 };
-use structopt::StructOpt;
-use tui::{backend::CrosstermBackend, terminal::Terminal};
 
 #[derive(RustEmbed)]
 #[folder = "resources/runtime"]
 struct Resources;
 
-#[derive(Debug, StructOpt)]
-#[structopt(name = "ttyper", about = "Terminal-based typing test.")]
+#[derive(Debug, Parser)]
+#[command(about, version)]
 struct Opt {
-    #[structopt(parse(from_os_str))]
+    /// Read test contents from the specified file, or "-" for stdin
+    #[arg(value_name = "PATH")]
     contents: Option<PathBuf>,
 
-    #[structopt(short, long)]
+    #[arg(short, long)]
     debug: bool,
 
     /// Specify word count
-    #[structopt(short, long, default_value = "50")]
+    #[arg(short, long, value_name = "N", default_value = "50")]
     words: num::NonZeroUsize,
 
     /// Use config file
-    #[structopt(short, long)]
+    #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
 
     /// Specify test language in file
-    #[structopt(long, parse(from_os_str))]
+    #[arg(long, value_name = "PATH")]
     language_file: Option<PathBuf>,
 
     /// Specify test language
-    #[structopt(short, long)]
+    #[arg(short, long, value_name = "LANG")]
     language: Option<String>,
 
     /// List installed languages
-    #[structopt(long)]
+    #[arg(long)]
     list_languages: bool,
+
+    /// Disable backtracking to completed words
+    #[arg(long)]
+    no_backtrack: bool,
+
+    /// Enable sudden death mode to restart on first error
+    #[arg(long)]
+    sudden_death: bool,
 }
 
 impl Opt {
     fn gen_contents(&self) -> Option<Vec<String>> {
         match &self.contents {
             Some(path) => {
-                let file = fs::File::open(path).expect("Error reading language file.");
-                let lines: Vec<String> = io::BufReader::new(file)
-                    .lines()
-                    .filter_map(Result::ok)
-                    .collect();
+                let lines: Vec<String> = if path.as_os_str() == "-" {
+                    std::io::stdin()
+                        .lock()
+                        .lines()
+                        .map_while(Result::ok)
+                        .collect()
+                } else {
+                    let file = fs::File::open(path).expect("Error reading language file.");
+                    io::BufReader::new(file)
+                        .lines()
+                        .map_while(Result::ok)
+                        .collect()
+                };
+
                 Some(lines.iter().map(String::from).collect())
             }
             None => {
@@ -78,8 +96,7 @@ impl Opt {
                     .language_file
                     .as_ref()
                     .map(fs::read)
-                    .map(Result::ok)
-                    .flatten()
+                    .and_then(Result::ok)
                     .or_else(|| fs::read(self.language_dir().join(&lang_name)).ok())
                     .or_else(|| {
                         Resources::get(&format!("language/{}", &lang_name))
@@ -114,18 +131,30 @@ impl Opt {
                 .clone()
                 .unwrap_or_else(|| self.config_dir().join("config.toml")),
         )
-        .map(|bytes| toml::from_slice(&bytes).expect("Configuration was ill-formed."))
+        .map(|bytes| {
+            toml::from_str(str::from_utf8(&bytes).unwrap_or_default())
+                .expect("Configuration was ill-formed.")
+        })
         .unwrap_or_default()
     }
 
     /// Installed languages under config directory
-    fn languages(&self) -> io::Result<Vec<OsString>> {
-        Ok(self
+    fn languages(&self) -> io::Result<impl Iterator<Item = OsString>> {
+        let builtin = Resources::iter().filter_map(|name| {
+            name.strip_prefix("language/")
+                .map(ToOwned::to_owned)
+                .map(OsString::from)
+        });
+
+        let configured = self
             .language_dir()
-            .read_dir()?
-            .filter_map(Result::ok)
-            .map(|e| e.file_name())
-            .collect())
+            .read_dir()
+            .into_iter()
+            .flatten()
+            .map_while(Result::ok)
+            .map(|e| e.file_name());
+
+        Ok(builtin.chain(configured))
     }
 
     /// Config directory
@@ -147,11 +176,11 @@ enum State {
 }
 
 impl State {
-    fn render_into<B: tui::backend::Backend>(
+    fn render_into<B: ratatui::backend::Backend>(
         &self,
         terminal: &mut Terminal<B>,
         config: &Config,
-    ) -> crossterm::Result<()> {
+    ) -> io::Result<()> {
         match self {
             State::Test(test) => {
                 terminal.draw(|f| {
@@ -168,24 +197,30 @@ impl State {
     }
 }
 
-fn main() -> crossterm::Result<()> {
-    let opt = Opt::from_args();
-    let config = opt.config();
+fn main() -> io::Result<()> {
+    let opt = Opt::parse();
+    if opt.debug {
+        dbg!(&opt);
+    }
 
+    let config = opt.config();
     if opt.debug {
         dbg!(&config);
     }
 
     if opt.list_languages {
         opt.languages()
-            .expect("Couldn't get installed languages under config directory. Make sure the config directory exists.")
-            .iter()
+            .unwrap()
             .for_each(|name| println!("{}", name.to_str().expect("Ill-formatted language name.")));
+
         return Ok(());
     }
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let contents = opt
+        .gen_contents()
+        .expect("Couldn't get test contents. Make sure the specified language actually exists.");
 
     terminal::enable_raw_mode()?;
     execute!(
@@ -196,9 +231,7 @@ fn main() -> crossterm::Result<()> {
     )?;
     terminal.clear()?;
 
-    let mut state = State::Test(Test::new(opt.gen_contents().expect(
-        "Couldn't get test contents. Make sure the specified language actually exists.",
-    )));
+    let mut state = State::Test(Test::new(contents, !opt.no_backtrack, opt.sudden_death));
 
     state.render_into(&mut terminal, &config)?;
     loop {
@@ -208,11 +241,13 @@ fn main() -> crossterm::Result<()> {
         match event {
             Event::Key(KeyEvent {
                 code: KeyCode::Char('c'),
+                kind: KeyEventKind::Press,
                 modifiers: KeyModifiers::CONTROL,
                 ..
             }) => break,
             Event::Key(KeyEvent {
                 code: KeyCode::Esc,
+                kind: KeyEventKind::Press,
                 modifiers: KeyModifiers::NONE,
                 ..
             }) => match state {
@@ -233,18 +268,45 @@ fn main() -> crossterm::Result<()> {
                     }
                 }
             }
-            State::Results(_) => match event {
+            State::Results(ref result) => match event {
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('r'),
+                    kind: KeyEventKind::Press,
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
-                    state = State::Test(Test::new(opt.gen_contents().expect(
+                    state = State::Test(Test::new(
+                        opt.gen_contents().expect(
                             "Couldn't get test contents. Make sure the specified language actually exists.",
-                        )));
+                        ),
+                        !opt.no_backtrack,
+                        opt.sudden_death
+                    ));
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('p'),
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    if result.missed_words.is_empty() {
+                        continue;
+                    }
+                    // repeat each missed word 5 times
+                    let mut practice_words: Vec<String> = (result.missed_words)
+                        .iter()
+                        .flat_map(|w| vec![w.clone(); 5])
+                        .collect();
+                    practice_words.shuffle(&mut thread_rng());
+                    state = State::Test(Test::new(
+                        practice_words,
+                        !opt.no_backtrack,
+                        opt.sudden_death,
+                    ));
                 }
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('q'),
+                    kind: KeyEventKind::Press,
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => break,

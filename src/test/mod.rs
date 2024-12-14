@@ -1,6 +1,6 @@
 pub mod results;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::fmt;
 use std::time::Instant;
 
@@ -8,6 +8,10 @@ pub struct TestEvent {
     pub time: Instant,
     pub key: KeyEvent,
     pub correct: Option<bool>,
+}
+
+pub fn is_missed_word_event(event: &TestEvent) -> bool {
+    event.correct != Some(true)
 }
 
 impl fmt::Debug for TestEvent {
@@ -36,23 +40,37 @@ impl From<String> for TestWord {
     }
 }
 
+impl From<&str> for TestWord {
+    fn from(string: &str) -> Self {
+        Self::from(string.to_string())
+    }
+}
+
 #[derive(Debug)]
 pub struct Test {
     pub words: Vec<TestWord>,
     pub current_word: usize,
     pub complete: bool,
+    pub backtracking_enabled: bool,
+    pub sudden_death_enabled: bool,
 }
 
 impl Test {
-    pub fn new(words: Vec<String>) -> Self {
+    pub fn new(words: Vec<String>, backtracking_enabled: bool, sudden_death_enabled: bool) -> Self {
         Self {
             words: words.into_iter().map(TestWord::from).collect(),
             current_word: 0,
             complete: false,
+            backtracking_enabled,
+            sudden_death_enabled,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
         let word = &mut self.words[self.current_word];
         match key.code {
             KeyCode::Char(' ') | KeyCode::Enter => {
@@ -64,16 +82,21 @@ impl Test {
                         key,
                     })
                 } else if !word.progress.is_empty() || word.text.is_empty() {
-                    word.events.push(TestEvent {
-                        time: Instant::now(),
-                        correct: Some(word.text == word.progress),
-                        key,
-                    });
-                    self.next_word();
+                    let correct = word.text == word.progress;
+                    if self.sudden_death_enabled && !correct {
+                        self.reset();
+                    } else {
+                        word.events.push(TestEvent {
+                            time: Instant::now(),
+                            correct: Some(correct),
+                            key,
+                        });
+                        self.next_word();
+                    }
                 }
             }
             KeyCode::Backspace => {
-                if word.progress.is_empty() {
+                if word.progress.is_empty() && self.backtracking_enabled {
                     self.last_word();
                 } else {
                     word.events.push(TestEvent {
@@ -84,8 +107,10 @@ impl Test {
                     word.progress.pop();
                 }
             }
-            // CTRL-BackSpace
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // CTRL-BackSpace and CTRL-W
+            KeyCode::Char('h') | KeyCode::Char('w')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 if self.words[self.current_word].progress.is_empty() {
                     self.last_word();
                 }
@@ -101,14 +126,19 @@ impl Test {
             }
             KeyCode::Char(c) => {
                 word.progress.push(c);
-                word.events.push(TestEvent {
-                    time: Instant::now(),
-                    correct: Some(word.text.starts_with(&word.progress[..])),
-                    key,
-                });
-                if word.progress == word.text && self.current_word == self.words.len() - 1 {
-                    self.complete = true;
-                    self.current_word = 0;
+                let correct = word.text.starts_with(&word.progress[..]);
+                if self.sudden_death_enabled && !correct {
+                    self.reset();
+                } else {
+                    word.events.push(TestEvent {
+                        time: Instant::now(),
+                        correct: Some(correct),
+                        key,
+                    });
+                    if word.progress == word.text && self.current_word == self.words.len() - 1 {
+                        self.complete = true;
+                        self.current_word = 0;
+                    }
                 }
             }
             _ => {}
@@ -128,5 +158,14 @@ impl Test {
         } else {
             self.current_word += 1;
         }
+    }
+
+    fn reset(&mut self) {
+        self.words.iter_mut().for_each(|word: &mut TestWord| {
+            word.progress.clear();
+            word.events.clear();
+        });
+        self.current_word = 0;
+        self.complete = false;
     }
 }

@@ -1,8 +1,11 @@
+use ratatui::{
+    style::{Color, Modifier, Style},
+    widgets::BorderType,
+};
 use serde::{
     de::{self, IntoDeserializer},
     Deserialize,
 };
-use tui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -34,6 +37,9 @@ pub struct Theme {
     #[serde(deserialize_with = "deserialize_style")]
     pub prompt_border: Style,
 
+    #[serde(deserialize_with = "deserialize_border_type")]
+    pub border_type: BorderType,
+
     #[serde(deserialize_with = "deserialize_style")]
     pub prompt_correct: Style,
     #[serde(deserialize_with = "deserialize_style")]
@@ -47,6 +53,9 @@ pub struct Theme {
     pub prompt_current_incorrect: Style,
     #[serde(deserialize_with = "deserialize_style")]
     pub prompt_current_untyped: Style,
+
+    #[serde(deserialize_with = "deserialize_style")]
+    pub prompt_cursor: Style,
 
     // results widget
     #[serde(deserialize_with = "deserialize_style")]
@@ -82,6 +91,8 @@ impl Default for Theme {
             input_border: Style::default().fg(Color::Cyan),
             prompt_border: Style::default().fg(Color::Green),
 
+            border_type: BorderType::Rounded,
+
             prompt_correct: Style::default().fg(Color::Green),
             prompt_incorrect: Style::default().fg(Color::Red),
             prompt_untyped: Style::default().fg(Color::Gray),
@@ -93,6 +104,8 @@ impl Default for Theme {
             prompt_current_untyped: Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
+
+            prompt_cursor: Style::default().add_modifier(Modifier::UNDERLINED),
 
             results_overview: Style::default()
                 .fg(Color::Cyan)
@@ -226,6 +239,37 @@ where
     deserializer.deserialize_str(ColorVisitor)
 }
 
+fn deserialize_border_type<'de, D>(deserializer: D) -> Result<BorderType, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    struct BorderTypeVisitor;
+    impl<'de> de::Visitor<'de> for BorderTypeVisitor {
+        type Value = BorderType;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a border type")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            match value {
+                "plain" => Ok(BorderType::Plain),
+                "rounded" => Ok(BorderType::Rounded),
+                "double" => Ok(BorderType::Double),
+                "thick" => Ok(BorderType::Thick),
+                "quadrantinside" => Ok(BorderType::QuadrantInside),
+                "quadrantoutside" => Ok(BorderType::QuadrantOutside),
+                _ => Err(E::invalid_value(
+                    de::Unexpected::Str(value),
+                    &"a border type",
+                )),
+            }
+        }
+    }
+
+    deserializer.deserialize_str(BorderTypeVisitor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +330,21 @@ mod tests {
                 .add_modifier(Modifier::ITALIC)
                 .add_modifier(Modifier::SLOW_BLINK)
         );
+    }
+
+    #[test]
+    fn deserializes_border_types() {
+        fn border_type(string: &str) -> BorderType {
+            deserialize_border_type(de::IntoDeserializer::<de::value::Error>::into_deserializer(
+                string,
+            ))
+            .expect("failed to deserialize border type")
+        }
+        assert_eq!(border_type("plain"), BorderType::Plain);
+        assert_eq!(border_type("rounded"), BorderType::Rounded);
+        assert_eq!(border_type("double"), BorderType::Double);
+        assert_eq!(border_type("thick"), BorderType::Thick);
+        assert_eq!(border_type("quadrantinside"), BorderType::QuadrantInside);
+        assert_eq!(border_type("quadrantoutside"), BorderType::QuadrantOutside);
     }
 }
